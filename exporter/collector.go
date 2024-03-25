@@ -16,13 +16,15 @@ package exporter
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"time"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/prometheus-community/json_exporter/config"
+	"github.com/itchyny/gojq"
 	"github.com/prometheus/client_golang/prometheus"
 	"k8s.io/client-go/util/jsonpath"
+	"cwkwan/json_exporter/config"
 )
 
 type JSONMetricCollector struct {
@@ -37,7 +39,9 @@ type JSONMetric struct {
 	KeyJSONPath            string
 	ValueJSONPath          string
 	LabelsJSONPaths        []string
+	JqTransform            string
 	ValueType              prometheus.ValueType
+	RegexpExtracts         []config.RegexpExtract
 	EpochTimestampJSONPath string
 }
 
@@ -49,29 +53,35 @@ func (mc JSONMetricCollector) Describe(ch chan<- *prometheus.Desc) {
 
 func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 	for _, m := range mc.JSONMetrics {
+		mcdata, err := applyJqTransform(mc.Logger, mc.Data, mc.JSONMetrics[0].JqTransform)
+		if err != nil {
+			level.Error(mc.Logger).Log("msg", "Error marshaling transformed json", "err", err)
+		}
 		switch m.Type {
 		case config.ValueScrape:
-			value, err := extractValue(mc.Logger, mc.Data, m.KeyJSONPath, false)
+			value, err := extractValue(mc.Logger, mcdata, m.KeyJSONPath, false)
 			if err != nil {
 				level.Error(mc.Logger).Log("msg", "Failed to extract value for metric", "path", m.KeyJSONPath, "err", err, "metric", m.Desc)
 				continue
 			}
-
+			if len(m.RegexpExtracts) > 0 {
+				value, err = applyRegexExtracts(m, value)
+			}
 			if floatValue, err := SanitizeValue(value); err == nil {
 				metric := prometheus.MustNewConstMetric(
 					m.Desc,
 					m.ValueType,
 					floatValue,
-					extractLabels(mc.Logger, mc.Data, m.LabelsJSONPaths)...,
+					extractLabels(mc.Logger, mcdata, m.LabelsJSONPaths)...,
 				)
-				ch <- timestampMetric(mc.Logger, m, mc.Data, metric)
+				ch <- timestampMetric(mc.Logger, m, mcdata, metric)
 			} else {
 				level.Error(mc.Logger).Log("msg", "Failed to convert extracted value to float64", "path", m.KeyJSONPath, "value", value, "err", err, "metric", m.Desc)
 				continue
 			}
 
-		case config.ObjectScrape:
-			values, err := extractValue(mc.Logger, mc.Data, m.KeyJSONPath, true)
+        case config.ObjectScrape:
+			values, err := extractValue(mc.Logger, mcdata, m.KeyJSONPath, true)
 			if err != nil {
 				level.Error(mc.Logger).Log("msg", "Failed to extract json objects for metric", "err", err, "metric", m.Desc)
 				continue
@@ -90,7 +100,9 @@ func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 						level.Error(mc.Logger).Log("msg", "Failed to extract value for metric", "path", m.ValueJSONPath, "err", err, "metric", m.Desc)
 						continue
 					}
-
+					if len(m.RegexpExtracts) > 0 {
+						value, err = applyRegexExtracts(m, value)
+					}
 					if floatValue, err := SanitizeValue(value); err == nil {
 						metric := prometheus.MustNewConstMetric(
 							m.Desc,
@@ -115,6 +127,50 @@ func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 }
 
+func applyJqTransform(logger log.Logger, data []byte, transform string) ([]byte, error) {
+	var v any
+
+	jq, err := gojq.Parse(transform)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error parsing jq transform", "err", err)
+	}
+
+	err = json.Unmarshal(data, &v)
+	if err != nil {
+		level.Error(logger).Log("msg", "Error unmarshaling json response", "err", err)
+	}
+
+	iter := jq.Run(v)
+
+	for {
+		i, ok := iter.Next()
+		if !ok {
+			break
+		}
+		if err, ok = i.(error); ok {
+			level.Error(logger).Log("msg", "Error running jq transform", "err", err)
+		}
+		return json.Marshal(i)
+	}
+	return nil, nil
+}
+
+func applyRegexExtracts(metric JSONMetric, s string) (string, error) {
+	var resultErr string
+	var res []byte
+
+	for _, strMetricSlice := range metric.RegexpExtracts {
+		indexes := strMetricSlice.Regex.FindStringSubmatchIndex(s)
+		if indexes == nil {
+			resultErr = fmt.Sprintf("No match found for metric %s with value %s for regexp %s", metric.Desc, s, strMetricSlice.Regex.String())
+			continue
+		}
+		res = strMetricSlice.Regex.ExpandString([]byte{}, strMetricSlice.Value, s, indexes)
+		break
+	}
+	return string(res), fmt.Errorf(resultErr)
+}
+
 // Returns the last matching value at the given json path
 func extractValue(logger log.Logger, data []byte, path string, enableJSONOutput bool) (string, error) {
 	var jsonData interface{}
@@ -124,12 +180,10 @@ func extractValue(logger log.Logger, data []byte, path string, enableJSONOutput 
 	if enableJSONOutput {
 		j.EnableJSONOutput(true)
 	}
-
 	if err := json.Unmarshal(data, &jsonData); err != nil {
 		level.Error(logger).Log("msg", "Failed to unmarshal data to json", "err", err, "data", data)
 		return "", err
 	}
-
 	if err := j.Parse(path); err != nil {
 		level.Error(logger).Log("msg", "Failed to parse jsonpath", "err", err, "path", path, "data", data)
 		return "", err
@@ -139,7 +193,6 @@ func extractValue(logger log.Logger, data []byte, path string, enableJSONOutput 
 		level.Error(logger).Log("msg", "Failed to execute jsonpath", "err", err, "path", path, "data", data)
 		return "", err
 	}
-
 	// Since we are finally going to extract only float64, unquote if necessary
 	if res, err := jsonpath.UnquoteExtend(buf.String()); err == nil {
 		return res, nil

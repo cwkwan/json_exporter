@@ -19,8 +19,10 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"net/url"
+	"os/exec"
 	"strconv"
 	"strings"
 	"text/template"
@@ -28,13 +30,26 @@ import (
 	"github.com/Masterminds/sprig/v3"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/prometheus-community/json_exporter/config"
 	"github.com/prometheus/client_golang/prometheus"
-	pconfig "github.com/prometheus/common/config"
+	"cwkwan/json_exporter/config"
+	"cwkwan/json_exporter/spnego_mixin"
 )
 
 func MakeMetricName(parts ...string) string {
 	return strings.Join(parts, "_")
+}
+
+func SanitizeIntValue(s string) (int64, error) {
+	var err error
+	var value int64
+	var resultErr string
+
+	if value, err = strconv.ParseInt(s, 10, 64); err == nil {
+		return value, nil
+	}
+	resultErr = fmt.Sprintf("%s", err)
+
+	return value, fmt.Errorf(resultErr)
 }
 
 func SanitizeValue(s string) (float64, error) {
@@ -58,19 +73,6 @@ func SanitizeValue(s string) (float64, error) {
 	if s == "<nil>" {
 		return math.NaN(), nil
 	}
-	return value, fmt.Errorf(resultErr)
-}
-
-func SanitizeIntValue(s string) (int64, error) {
-	var err error
-	var value int64
-	var resultErr string
-
-	if value, err = strconv.ParseInt(s, 10, 64); err == nil {
-		return value, nil
-	}
-	resultErr = fmt.Sprintf("%s", err)
-
 	return value, fmt.Errorf(resultErr)
 }
 
@@ -105,33 +107,39 @@ func CreateMetricsList(c config.Module) ([]JSONMetric, error) {
 				),
 				KeyJSONPath:            metric.Path,
 				LabelsJSONPaths:        variableLabelsValues,
+				JqTransform:            metric.Transform.Jq,
 				ValueType:              valueType,
+				RegexpExtracts:         metric.RegexpExtracts,
 				EpochTimestampJSONPath: metric.EpochTimestamp,
 			}
 			metrics = append(metrics, jsonMetric)
 		case config.ObjectScrape:
-			for subName, valuePath := range metric.Values {
+			for subName, values := range metric.Values {
 				name := MakeMetricName(metric.Name, subName)
 				var variableLabels, variableLabelsValues []string
 				for k, v := range metric.Labels {
 					variableLabels = append(variableLabels, k)
 					variableLabelsValues = append(variableLabelsValues, v)
 				}
-				jsonMetric := JSONMetric{
-					Type: config.ObjectScrape,
-					Desc: prometheus.NewDesc(
-						name,
-						metric.Help,
-						variableLabels,
-						nil,
-					),
-					KeyJSONPath:            metric.Path,
-					ValueJSONPath:          valuePath,
-					LabelsJSONPaths:        variableLabelsValues,
-					ValueType:              valueType,
-					EpochTimestampJSONPath: metric.EpochTimestamp,
+				for _, value := range values {
+					jsonMetric := JSONMetric{
+						Type: config.ObjectScrape,
+						Desc: prometheus.NewDesc(
+							name,
+							value.Help,
+							variableLabels,
+							nil,
+						),
+						KeyJSONPath:            metric.Path,
+						ValueJSONPath:          value.Value,
+						LabelsJSONPaths:        variableLabelsValues,
+						JqTransform:            metric.Transform.Jq,
+						ValueType:              valueType,
+						RegexpExtracts:         value.RegexpExtracts,
+						EpochTimestampJSONPath: metric.EpochTimestamp,
+					}
+					metrics = append(metrics, jsonMetric)
 				}
-				metrics = append(metrics, jsonMetric)
 			}
 		default:
 			return nil, fmt.Errorf("Unknown metric type: '%s', for metric: '%s'", metric.Type, metric.Name)
@@ -142,6 +150,7 @@ func CreateMetricsList(c config.Module) ([]JSONMetric, error) {
 
 type JSONFetcher struct {
 	module config.Module
+	url    string
 	ctx    context.Context
 	logger log.Logger
 	method string
@@ -150,8 +159,10 @@ type JSONFetcher struct {
 
 func NewJSONFetcher(ctx context.Context, logger log.Logger, m config.Module, tplValues url.Values) *JSONFetcher {
 	method, body := renderBody(logger, m.Body, tplValues)
+	url := renderUrl(logger, m.Url, tplValues)
 	return &JSONFetcher{
 		module: m,
+		url:    url,
 		ctx:    ctx,
 		logger: logger,
 		method: method,
@@ -159,24 +170,36 @@ func NewJSONFetcher(ctx context.Context, logger log.Logger, m config.Module, tpl
 	}
 }
 
-func (f *JSONFetcher) FetchJSON(endpoint string) ([]byte, error) {
+func (f *JSONFetcher) FetchJSON(moduleMetric *spnego_mixin.ExporterMetric, endpoint string, clientip string) ([]byte, error) {
 	httpClientConfig := f.module.HTTPClientConfig
-	client, err := pconfig.NewClientFromConfig(httpClientConfig, "fetch_json", pconfig.WithKeepAlivesDisabled(), pconfig.WithHTTP2Disabled())
+	client, err := spnego_mixin.NewClient(httpClientConfig, "json_exporter", moduleMetric, f.logger)
 	if err != nil {
 		level.Error(f.logger).Log("msg", "Error generating HTTP client", "err", err)
 		return nil, err
 	}
 
 	var req *http.Request
-	req, err = http.NewRequest(f.method, endpoint, f.body)
+	req, err = http.NewRequest(f.method, f.url, f.body)
 	req = req.WithContext(f.ctx)
 	if err != nil {
 		level.Error(f.logger).Log("msg", "Failed to create request", "err", err)
 		return nil, err
 	}
+	req.Header.Add("User-Agent", "esp prometheus json exporter/1.0")
+	req.Header.Add("X-Forwarded-For", GetOutboundIP().String())
 
 	for key, value := range f.module.Headers {
-		req.Header.Add(key, value)
+		if strings.HasPrefix(key, "Authorization") && strings.HasPrefix(value, "`") {
+			fields := strings.Fields(strings.Trim(value, "`"))
+			out, err := exec.Command("/bin/bash", "-c", "/bin/vault tell "+fields[1]+" "+fields[2]).Output()
+			if err != nil {
+				level.Error(f.logger).Log("msg", "Failed getting secret from vault", "vault namespace", fields[1], "vault key", fields[2], "err", err)
+				return nil, err
+			}
+			req.Header.Add(key, string(out))
+		} else {
+			req.Header.Add(key, value)
+		}
 	}
 	if req.Header.Get("Accept") == "" {
 		req.Header.Add("Accept", "application/json")
@@ -202,17 +225,16 @@ func (f *JSONFetcher) FetchJSON(endpoint string) ([]byte, error) {
 			}
 		}
 		if !success {
-			return nil, errors.New(resp.Status)
+			return nil, errors.New("http response: " + resp.Status)
 		}
 	} else if resp.StatusCode/100 != 2 {
-		return nil, errors.New(resp.Status)
+		return nil, errors.New("http response: " + resp.Status)
 	}
 
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, err
 	}
-
 	return data, nil
 }
 
@@ -243,4 +265,34 @@ func renderBody(logger log.Logger, body config.Body, tplValues url.Values) (meth
 		br = strings.NewReader(b.String())
 	}
 	return
+}
+
+func renderUrl(logger log.Logger, url_template string, tplValues url.Values) (url string) {
+	tpl, err := template.New("base").Funcs(sprig.TxtFuncMap()).Parse(url_template)
+	if err != nil {
+		level.Error(logger).Log("msg", "Failed to parse target url", "err", err, "url", url_template)
+		return
+	}
+	tpl = tpl.Option("missingkey=zero")
+	var b strings.Builder
+	if err := tpl.Execute(&b, tplValues); err != nil {
+		level.Error(logger).Log("msg", "Failed to render url with values", "err", err, "url", url_template)
+
+		// `tplValues` can contain sensitive values, so log it only when in debug mode
+		level.Debug(logger).Log("msg", "Failed to render url with values", "err", err, "tempalte", url_template, "values", tplValues, "rendered_url", b.String())
+		return
+	}
+	url = b.String()
+
+	return url
+}
+
+// Get preferred outbound ip of this machine
+func GetOutboundIP() net.IP {
+	conn, _ := net.Dial("udp", "10.2.3.4:123")
+
+	defer conn.Close()
+
+	localAddr := conn.LocalAddr().(*net.UDPAddr)
+	return localAddr.IP
 }

@@ -23,8 +23,6 @@ import (
 	"github.com/alecthomas/kingpin/v2"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/prometheus-community/json_exporter/config"
-	"github.com/prometheus-community/json_exporter/exporter"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/prometheus/common/promlog"
@@ -32,6 +30,9 @@ import (
 	"github.com/prometheus/common/version"
 	"github.com/prometheus/exporter-toolkit/web"
 	"github.com/prometheus/exporter-toolkit/web/kingpinflag"
+	"cwkwan/json_exporter/config"
+	"cwkwan/json_exporter/exporter"
+	"cwkwan/json_exporter/spnego_mixin"
 )
 
 var (
@@ -42,6 +43,8 @@ var (
 		"Path under which to expose metrics.",
 	).Default("/metrics").String()
 	toolkitFlags = kingpinflag.AddFlags(kingpin.CommandLine, ":7979")
+
+	moduleMetric = make(map[string]*spnego_mixin.ExporterMetric)
 )
 
 func Run() {
@@ -136,10 +139,35 @@ func probeHandler(w http.ResponseWriter, r *http.Request, logger log.Logger, con
 		return
 	}
 
+	if _, ok := moduleMetric[module]; !ok {
+		moduleMetric[module] = &spnego_mixin.ExporterMetric{
+			InflightGauge: prometheus.NewGauge(prometheus.GaugeOpts{
+				Name: module + "_client_in_flight_requests",
+				Help: "A gauge of in-flight requests for the wrapped client.",
+			}),
+			ResponseCount: prometheus.NewCounterVec(
+				prometheus.CounterOpts{
+					Name: module + "_client_requests_total",
+					Help: "A counter for requests from the wrapped client.",
+				},
+				[]string{"code", "method"},
+			),
+			DurationHistorgram: prometheus.NewHistogramVec(
+				prometheus.HistogramOpts{
+					Name:    module + "_client_request_duration_seconds",
+					Help:    "A histogram of request latencies.",
+					Buckets: prometheus.DefBuckets,
+				},
+				[]string{},
+			),
+		}
+	}
+
 	fetcher := exporter.NewJSONFetcher(ctx, logger, config.Modules[module], r.URL.Query())
-	data, err := fetcher.FetchJSON(target)
+	data, err := fetcher.FetchJSON(moduleMetric[module], target, r.RemoteAddr)
 	if err != nil {
 		http.Error(w, "Failed to fetch JSON response. TARGET: "+target+", ERROR: "+err.Error(), http.StatusServiceUnavailable)
+		level.Error(logger).Log("msg", "Failed to fetch JSON response. TARGET: "+target, "err", err)
 		return
 	}
 

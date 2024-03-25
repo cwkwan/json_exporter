@@ -14,10 +14,18 @@
 package config
 
 import (
+	"errors"
 	"os"
+	"regexp"
 
 	pconfig "github.com/prometheus/common/config"
 	"gopkg.in/yaml.v2"
+)
+
+var (
+	DefaultRegexpExtract = RegexpExtract{
+		Value: "$1",
+	}
 )
 
 // Metric contains values that define a metric
@@ -25,11 +33,33 @@ type Metric struct {
 	Name           string
 	Path           string
 	Labels         map[string]string
+	Transform      Transform
 	Type           ScrapeType
 	ValueType      ValueType
+	RegexpExtracts []RegexpExtract `yaml:"regex_extracts,omitempty"`
 	EpochTimestamp string
 	Help           string
-	Values         map[string]string
+	Values         map[string][]Values
+}
+
+type Transform struct {
+	Jq string
+}
+
+type RegexpExtract struct {
+	Value string `yaml:"value"`
+	Regex Regexp `yaml:"regex"`
+}
+
+type Values struct {
+	Help           string
+	Value          string
+	RegexpExtracts []RegexpExtract `yaml:"regex_extracts,omitempty"`
+}
+
+// Regexp encapsulates a regexp.Regexp and makes it YAML marshalable.
+type Regexp struct {
+	*regexp.Regexp
 }
 
 type ScrapeType string
@@ -54,7 +84,8 @@ type Config struct {
 
 // Module contains metrics and headers defining a configuration
 type Module struct {
-	Headers          map[string]string        `yaml:"headers,omitempty"`
+	Headers          map[string]string `yaml:"headers,omitempty"`
+	Url              string
 	Metrics          []Metric                 `yaml:"metrics"`
 	HTTPClientConfig pconfig.HTTPClientConfig `yaml:"http_client_config,omitempty"`
 	Body             Body                     `yaml:"body,omitempty"`
@@ -64,6 +95,25 @@ type Module struct {
 type Body struct {
 	Content    string `yaml:"content"`
 	Templatize bool   `yaml:"templatize,omitempty"`
+}
+
+func (c *RegexpExtract) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	*c = DefaultRegexpExtract
+	type plain RegexpExtract
+	return unmarshal((*plain)(c))
+}
+
+func (re *Regexp) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	var s string
+	if err := unmarshal(&s); err != nil {
+		return err
+	}
+	regex, err := regexp.Compile("^(?:" + s + ")$")
+	if err != nil {
+		return err
+	}
+	re.Regexp = regex
+	return nil
 }
 
 func LoadConfig(configPath string) (Config, error) {
@@ -79,6 +129,9 @@ func LoadConfig(configPath string) (Config, error) {
 
 	// Complete Defaults
 	for _, module := range config.Modules {
+		if module.Url == "" {
+			return config, errors.New("module URL not set")
+		}
 		for i := 0; i < len(module.Metrics); i++ {
 			if module.Metrics[i].Type == "" {
 				module.Metrics[i].Type = ValueScrape
@@ -89,8 +142,21 @@ func LoadConfig(configPath string) (Config, error) {
 			if module.Metrics[i].ValueType == "" {
 				module.Metrics[i].ValueType = ValueTypeUntyped
 			}
+			for _, regexpextract := range module.Metrics[i].RegexpExtracts {
+				if regexpextract.Value == "" {
+					regexpextract.Value = "$1"
+				}
+			}
+			for _, values := range module.Metrics[i].Values {
+				for _, value := range values {
+					for _, regexpextract := range value.RegexpExtracts {
+						if regexpextract.Value == "" {
+							regexpextract.Value = "$1"
+						}
+					}
+				}
+			}
 		}
 	}
-
 	return config, nil
 }
