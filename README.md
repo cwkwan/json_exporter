@@ -7,6 +7,13 @@ A [prometheus](https://prometheus.io/) exporter which scrapes remote JSON by JSO
 - [Supported JSONPath Syntax](https://kubernetes.io/docs/reference/kubectl/jsonpath/)
 - [Examples configurations](/examples)
 
+### Added in this fork:
+- Extract values by regex
+- Extract values by jq
+- [Go Template](https://golang.org/pkg/text/template) in URL
+- SPNEGO authentication to target endpoint, Linux only with hardcoded KRB5 conf path
+- HTTP status as metrics of exporter observability
+
 ## Example Usage
 
 ```console
