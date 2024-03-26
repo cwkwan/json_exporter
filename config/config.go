@@ -160,3 +160,4 @@ func LoadConfig(configPath string) (Config, error) {
 	}
 	return config, nil
 }
+

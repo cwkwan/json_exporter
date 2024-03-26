@@ -178,3 +178,4 @@ func probeHandler(w http.ResponseWriter, r *http.Request, logger log.Logger, con
 	h.ServeHTTP(w, r)
 
 }
+

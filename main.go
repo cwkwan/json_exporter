@@ -14,9 +14,10 @@
 package main
 
 import (
-	"github.com/prometheus-community/json_exporter/cmd"
+	"cwkwan/json_exporter/cmd"
 )
 
 func main() {
 	cmd.Run()
 }
+

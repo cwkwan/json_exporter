@@ -291,3 +291,4 @@ func (krb *krb5) SetSPNEGOHeader(req *http.Request, canonicalize bool) error {
 	}
 	return spnego.SetSPNEGOHeader(krb.clnt, req, "HTTP/"+host)
 }
+

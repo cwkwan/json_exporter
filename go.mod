@@ -1,4 +1,4 @@
-module github.com/prometheus-community/json_exporter
+module cwkwan/json_exporter
 
 go 1.19
 

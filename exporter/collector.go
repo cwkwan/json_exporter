@@ -80,7 +80,7 @@ func (mc JSONMetricCollector) Collect(ch chan<- prometheus.Metric) {
 				continue
 			}
 
-        case config.ObjectScrape:
+			case config.ObjectScrape:
 			values, err := extractValue(mc.Logger, mcdata, m.KeyJSONPath, true)
 			if err != nil {
 				level.Error(mc.Logger).Log("msg", "Failed to extract json objects for metric", "err", err, "metric", m.Desc)
@@ -231,3 +231,4 @@ func timestampMetric(logger log.Logger, m JSONMetric, data []byte, pm prometheus
 	timestamp := time.UnixMilli(epochTime)
 	return prometheus.NewMetricWithTimestamp(timestamp, pm)
 }
+
